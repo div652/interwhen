@@ -84,6 +84,280 @@ This restart is how rollback works. The monitor normally stores the trace as it
 existed at the verification boundary. Any tokens generated after that boundary
 while verification was running are discarded.
 
+### Complete walkthrough of `stream_completion()`
+
+The function signature is:
+
+```python
+async def stream_completion(
+    prompt,
+    prev_text="",
+    llm_server=None,
+    monitors=[],
+    add_delay=False,
+    num_calls_index=0,
+    termination_requires_validation=False,
+    async_execution=True,
+    tokenizer=None,
+):
+```
+
+| Parameter | Meaning |
+|---|---|
+| `prompt` | Original prompt sent to the model |
+| `prev_text` | Text retained from an earlier generation attempt; empty on the first call |
+| `llm_server` | Dictionary containing the vLLM URL, HTTP headers, and generation payload |
+| `monitors` | Monitor instances that inspect the generated text; currently only `monitors[0]` is used |
+| `add_delay` | Adds a short delay after each chunk, mainly for demonstrations |
+| `num_calls_index` | Counts correction/restart attempts |
+| `termination_requires_validation` | Present in the API but currently unused |
+| `async_execution` | If `True`, generation continues while verification runs |
+| `tokenizer` | Hugging Face tokenizer used to count input tokens |
+
+#### A. Initialize state for this generation attempt
+
+```python
+stop_event = asyncio.Event()
+stop_info = {
+    "generated_text": None,
+    "feedback": None,
+    "token_index": None,
+}
+monitor_tasks = []
+generated_text = prev_text
+```
+
+- `stop_event` is an async signal shared by the stream and verifier tasks.
+- `stop_info` is where a verifier writes the trace to retain and the feedback
+  to inject.
+- `monitor_tasks` tracks all verifier tasks started during this attempt.
+- `generated_text` begins with the corrected text from the previous attempt.
+
+Each recursive call creates a fresh event, fresh task list, and fresh HTTP
+request.
+
+#### B. Build the vLLM request
+
+```python
+llm_server["payload"]["prompt"] = prompt + generated_text
+token_count = count_tokens(llm_server["payload"]["prompt"], tokenizer)
+llm_server["payload"]["max_tokens"] = (
+    llm_server["payload"]["context_length"] - token_count
+)
+```
+
+The model receives both the original prompt and all retained generation:
+
+```text
+actual model input = original prompt + corrected/previous text
+```
+
+`max_tokens` is set to the remaining context-window capacity.
+
+#### C. Open and consume the streaming HTTP response
+
+```python
+async with httpx.AsyncClient(timeout=None) as client:
+    async with client.stream(
+        "POST",
+        llm_server["url"],
+        headers=llm_server["headers"],
+        json=llm_server["payload"],
+    ) as response:
+        async for line in response.aiter_lines():
+```
+
+vLLM sends Server-Sent Event lines as tokens or short text chunks become
+available:
+
+```text
+data: {"choices": [{"text": "Try"}]}
+data: {"choices": [{"text": " 8 / 2"}]}
+data: {"choices": [{"text": " = 4.\n"}]}
+data: [DONE]
+```
+
+The code removes the `data: ` prefix, parses the JSON, and extracts:
+
+```python
+chunk = json.loads(data)["choices"][0]["text"]
+```
+
+Malformed lines are skipped. `[DONE]` means the server has finished generating.
+
+#### D. Append the chunk and possibly start a verifier
+
+```python
+generated_text += chunk
+
+if len(monitors) > 0 and not stop_event.is_set():
+    stepFlag, step = monitors[0].step_extractor(chunk, generated_text)
+```
+
+`step_extractor()` decides whether the latest chunk completed a useful
+verification boundary, such as:
+
+- a newline;
+- a `Wait` reflection;
+- a complete structured reasoning step;
+- a `\boxed{...}` answer.
+
+If a boundary is found, verification is scheduled:
+
+```python
+task = asyncio.create_task(
+    monitors[0].verify(
+        step,
+        len(generated_text) - len(chunk),
+        stop_event,
+        stop_info,
+    )
+)
+monitor_tasks.append(task)
+```
+
+`asyncio.create_task()` does not normally create another operating-system
+thread. It schedules the verifier on the same event loop. Whenever the HTTP
+stream is waiting for another network chunk, the event loop can advance the
+verifier task.
+
+The value named `token_index` is actually the character offset where the
+current chunk begins:
+
+```python
+len(generated_text) - len(chunk)
+```
+
+When `async_execution=False`, the function immediately does `await task`.
+Generation therefore pauses at every verification boundary until that
+verification finishes.
+
+#### E. How a verifier stops generation
+
+For a valid state, `verify()` simply returns and generation continues.
+
+For an invalid state, it writes correction information and sets the event:
+
+```python
+event_info["generated_text"] = step
+event_info["feedback"] = verifier_feedback
+event.set()
+```
+
+The main streaming loop checks this event before accepting another chunk:
+
+```python
+if stop_event.is_set():
+    break
+```
+
+Because verification is asynchronous, the model may have generated additional
+chunks after the checked boundary. Those chunks are speculative and are not
+necessarily included in `stop_info["generated_text"]`.
+
+#### F. Finish or cancel verifier tasks
+
+After leaving the HTTP stream:
+
+```python
+if stop_event.is_set():
+    await _cancel_tasks(monitor_tasks)
+else:
+    await asyncio.gather(*monitor_tasks, return_exceptions=True)
+```
+
+- If one verifier requested an intervention, unfinished verifier tasks are
+  cancelled.
+- Otherwise, the function waits for every scheduled verifier to finish before
+  deciding that the output is safe to return.
+
+#### G. Fix, restart, or return
+
+If the event was set, the selected monitor builds a corrected trace:
+
+```python
+corrected_text = await monitors[0].fix(generated_text, stop_info)
+```
+
+There are four possible outcomes:
+
+1. After 50 correction attempts, return the current text.
+2. If feedback is exactly `the answer is \boxed{no solution}`, return the
+   corrected text and abstain.
+3. If `phase == "final_answer_correct"`, return the verified answer.
+4. Otherwise, recursively call `stream_completion()` with
+   `prev_text=corrected_text`.
+
+If no verifier sets the event, the function returns the completed
+`generated_text`.
+
+### Control-flow graph
+
+```mermaid
+flowchart TD
+    A["stream_completion(prompt, prev_text)"] --> B["Create stop_event,<br/>stop_info, monitor_tasks"]
+    B --> C["Build payload:<br/>prompt + prev_text"]
+    C --> D["POST streaming request to vLLM"]
+    D --> E{"Next SSE line"}
+    E -->|"data: [DONE]"| M["Leave HTTP stream"]
+    E -->|"token chunk"| F{"stop_event set?"}
+    F -->|"Yes"| M
+    F -->|"No"| G["Append chunk to generated_text"]
+    G --> H{"Monitor boundary found?"}
+    H -->|"No"| E
+    H -->|"Yes"| I["create_task(verify(...))"]
+    I -. "generation continues while verifier waits/runs" .-> E
+    I --> J{"Verifier result"}
+    J -->|"Valid"| E
+    J -->|"Invalid"| K["Write stop_info<br/>and set stop_event"]
+    K --> F
+    M --> N{"stop_event set?"}
+    N -->|"No"| O["Await remaining verifier tasks"]
+    O --> P{"Event set after checks?"}
+    P -->|"No"| Q["Return generated_text"]
+    P -->|"Yes"| R["monitor.fix(...)"]
+    N -->|"Yes"| S["Cancel unfinished verifier tasks"]
+    S --> R
+    R --> T{"Terminal condition?"}
+    T -->|"No solution, verified final,<br/>or retry limit"| U["Return corrected_text"]
+    T -->|"Needs another attempt"| V["Recursive stream_completion<br/>with corrected prev_text"]
+    V --> B
+```
+
+### Concrete Game of 24 example
+
+Assume the prompt is:
+
+```text
+Use 1, 2, 6, and 8 exactly once to make 24.
+```
+
+The execution can proceed like this:
+
+| Time | Main stream | Monitor |
+|---|---|---|
+| 1 | Generates `Try 8 / 2 = 4.\n` | Newline boundary detected |
+| 2 | Continues generating | Side stream extracts `{8 / 2}` |
+| 3 | Continues generating | Verifier sees intermediate state `[4, 1, 6]` can still reach 24 |
+| 4 | Generates another attempted expression | Another boundary starts another verifier |
+| 5 | May generate speculative text after that boundary | Verifier discovers the expression is a dead end |
+| 6 | Stream notices `stop_event` and stops | Monitor stores the checked prefix plus corrective feedback |
+| 7 | Recursive call starts with corrected text | Model tries a different approach |
+| 8 | Generates `(8 / 2) * 6 * 1` | Verifier confirms it uses every number and equals 24 |
+| 9 | Monitor injects `</think>` and final-answer guidance | Model emits the verified final answer |
+
+The corrected input for the recursive call looks conceptually like:
+
+```text
+Original prompt
++ reasoning retained up to the checked boundary
++ "Wait, that expression is a dead end. Let me try a different approach."
+```
+
+Any speculative text generated after the rejected boundary is omitted. This is
+the key mechanism that lets InterWhen correct one trajectory rather than
+discarding the whole response and starting from scratch.
+
 ### What "forking inference" means in this code
 
 There is no explicit vLLM `fork_kv_cache()` operation. A fork is implemented
@@ -500,4 +774,3 @@ Several details are narrower than the architecture described in the paper:
 5. [`examples/TTSwithVerification/interwhen/game24_example.py`](./examples/TTSwithVerification/interwhen/game24_example.py)
 6. [`examples/AgenticBenchmarks/tau2bench/orchestrator.py`](./examples/AgenticBenchmarks/tau2bench/orchestrator.py)
 7. [`examples/AgenticBenchmarks/tau2bench/autoformalization_pipeline/README.md`](./examples/AgenticBenchmarks/tau2bench/autoformalization_pipeline/README.md)
-
